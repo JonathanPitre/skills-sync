@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+# Update git-backed agent skills in ~/.agents/skills, then Superpowers plugins.
+set -euo pipefail
+
+LOG_PREFIX="skills-sync"
+HUB="${SKILLS_HUB:-$HOME/.agents/skills}"
+SOURCES="${SKILLS_SYNC_SOURCES:-$HOME/.config/skills-sync/sources}"
+CANONICAL="${SUPERPOWERS_CANONICAL:-$HOME/.local/share/superpowers}"
+CURSOR_PLUGIN="${CURSOR_PLUGIN:-$HOME/.cursor/plugins/local/superpowers}"
+OPENCODE_JSON="${OPENCODE_JSON:-$HOME/.config/opencode/opencode.json}"
+WATCHLIST=(qwen droid grok copilot agy devin)
+
+tag=""
+hub_fatal=0
+
+log() { printf '%s %s\n' "$LOG_PREFIX" "$*"; }
+die() { log "error: $*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+try() {
+  local name=$1 st
+  shift
+  if "$@"; then log "ok $name"; else st=$?; log "FAIL $name (exit $st)"; return "$st"; fi
+}
+
+already_ok() {
+  local text=$1
+  [[ $text == *already\ installed* || $text == *already\ enabled* || $text == *Already\ installed* ]]
+}
+
+latest_tag() {
+  git -C "$CANONICAL" tag --list 'v*' --sort=-version:refname | head -n 1
+}
+
+plugin_version() {
+  local f=$1
+  [[ -f $f ]] || return 1
+  jq -r '.version // empty' "$f" 2>/dev/null
+}
+
+origin_branch() {
+  local dir=$1 ref
+  ref=$(git -C "$dir" ls-remote --symref origin HEAD | awk '$1 == "ref:" && $3 == "HEAD" {print $2}') || return 1
+  [[ $ref == refs/heads/* ]] || { log "error: origin did not advertise a default branch: $dir" >&2; return 1; }
+  printf '%s\n' "${ref#refs/heads/}"
+}
+
+ensure_clone() {
+  local url=$1 dir=$2 origin branch ahead revision repo http tmp response status_line
+  if [[ ! -d $dir/.git ]]; then
+    if [[ -e $dir ]]; then log "error: clone target exists but is not a git repo: $dir" >&2; return 1; fi
+    git clone "$url" "$dir" || return 1
+  fi
+  origin=$(git -C "$dir" remote get-url origin 2>/dev/null) || return 1
+  [[ $origin == "$url" ]] || { log "error: unexpected origin at $dir: $origin" >&2; return 1; }
+  [[ -z $(git -C "$dir" status --porcelain) ]] || { log "error: dirty source; preserving local work: $dir" >&2; return 1; }
+  git -C "$dir" fetch --prune origin || return 1
+  branch=$(origin_branch "$dir") || { log "error: cannot determine origin default branch: $dir" >&2; return 1; }
+  git -C "$dir" fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || return 1
+  revision="origin/$branch"
+  repo=${url#https://github.com/}; repo=${repo%.git}
+  if [[ $repo != "$url" && $repo == */* ]]; then
+  have curl && have jq || { log "error: curl and jq required for stable GitHub source selection" >&2; return 1; }
+  tmp=$(mktemp) || return 1
+  if have gh && gh auth status >/dev/null 2>&1; then
+    gh api --include "repos/$repo/releases/latest" > "$tmp" 2>/dev/null || true
+    response=$(<"$tmp")
+    status_line=${response%%$'\r\n'*}
+    http=${status_line#HTTP/* }; http=${http%% *}
+    response=${response#*$'\r\n\r\n'}
+    printf '%s\n' "$response" > "$tmp"
+    [[ $http =~ ^[0-9]{3}$ ]] || { rm -f "$tmp"; log "error: invalid GitHub release response for $repo" >&2; return 1; }
+  else
+    http=$(curl -sS -L -o "$tmp" -w '%{http_code}' "https://api.github.com/repos/$repo/releases/latest" -H 'Accept: application/vnd.github+json') || { rm -f "$tmp"; return 1; }
+  fi
+    if [[ $http == 200 ]]; then
+      jq -e 'type == "object" and (.draft == false) and (.prerelease == false) and (.tag_name|type == "string" and length > 0)' "$tmp" >/dev/null || { rm -f "$tmp"; log "error: invalid GitHub release response for $repo" >&2; return 1; }
+      revision=$(jq -r '.tag_name' "$tmp")
+      git -C "$dir" fetch origin "refs/tags/$revision:refs/tags/$revision" || { rm -f "$tmp"; return 1; }
+    elif [[ $http != 404 ]]; then rm -f "$tmp"; log "error: GitHub release lookup returned HTTP $http for $repo" >&2; return 1
+    fi
+    rm -f "$tmp"
+  fi
+  if ! git -C "$dir" for-each-ref --format="%(refname)" --contains HEAD refs/remotes/origin/ | grep -q .; then log "error: local commits not reachable from fetched origin refs; preserving $dir" >&2; return 1; fi
+
+  git -C "$dir" checkout --detach "$revision" --quiet || return 1
+  log "hub-src $dir @$revision $(git -C "$dir" rev-parse --short HEAD)"
+}
+
+skip_skill_md() {
+  local p=$1
+  case $p in
+    */.git/*|*/node_modules/*|*/.openclaw/*|*/.claude-plugin/*|*/.cursor-plugin/*|*/.codex-plugin/*|*/.factory-plugin/*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# Prints: name<TAB>absdir  (one skill per name; prefer .../skills/<name>/)
+discover_skills() {
+  local clone=$1 skillmd dir name rel score
+  local -A best_dir=() best_score=()
+  local -a duplicates=()
+  [[ -d $clone/skills ]] || { log "error: skills directory missing: $clone" >&2; return 1; }
+  local files
+  files=$(mktemp) || return 1
+  find "$clone/skills" -type f -name SKILL.md -print0 > "$files" || { rm -f "$files"; return 1; }
+   while IFS= read -r -d "" skillmd; do
+    if [[ $clone == *mattpocock-skills-omp* ]]; then case $skillmd in */skills/deprecated/*|*/skills/misc/*) continue;; esac; fi
+    dir=$(dirname "$skillmd"); name=$(basename "$dir"); rel=${skillmd#"$clone/skills/"}
+    [[ $rel != "$skillmd" && -n $name ]] || continue
+    if [[ $rel == "$name/SKILL.md" ]]; then score=2; else score=1; fi
+    if [[ -z ${best_dir[$name]+x} || $score -gt ${best_score[$name]} ]]; then
+      best_dir[$name]=$dir; best_score[$name]=$score
+    elif [[ $score -eq ${best_score[$name]} && ${best_dir[$name]} != "$dir" ]]; then
+      duplicates+=("$name")
+    fi
+  done < "$files"
+  rm -f "$files"
+  if ((${#duplicates[@]})); then
+    for name in "${duplicates[@]}"; do printf "error: duplicate skill name: %s\\n" "$name" >&2; done
+    return 1
+  fi
+  ((${#best_dir[@]})) || { log "error: no skills discovered: $clone" >&2; return 1; }
+   for name in "${!best_dir[@]}"; do printf "%s\\t%s\\n" "$name" "${best_dir[$name]}"; done | sort
+}
+
+is_packaged() {
+  local resolved=$1
+  [[ $resolved == /usr/share/* ]]
+}
+
+link_hub_skill() {
+  local name=$1 target=$2 source_root=${3:-$(dirname "$2")} dest resolved raw
+  dest="$HUB/$name"
+  mkdir -p "$HUB"
+  if [[ -L $dest ]]; then
+    raw=$(readlink "$dest") || return 1
+    case $raw in /usr/share/*) log "skip packaged $name -> $raw"; return 0;; esac
+    if [[ $raw == "$source_root"/* || $raw == "$HOME/.local/share/skills-sync"/* ]]; then
+      ln -sfn -- "$target" "$dest"; return
+    fi
+    resolved=$(readlink -f "$dest" 2>/dev/null || true)
+    [[ $resolved == /usr/share/* ]] && { log "skip packaged $name -> $resolved"; return 0; }
+    log "error: unmanaged skill destination: $dest" >&2; return 1
+  fi
+  if [[ -e $dest ]]; then log "error: unmanaged skill destination: $dest" >&2; return 1; fi
+  ln -s -- "$target" "$dest"
+}
+
+harness_dirs() {
+  printf '%s\n' \
+    "$HOME/.claude/skills" \
+    "$HOME/.codex/skills" \
+    "$HOME/.copilot/skills" \
+    "$HOME/.config/opencode/skills" \
+    "$HOME/.gemini/skills" \
+    "$HOME/.hermes/skills" \
+    "$HOME/.pi/skills" \
+    "$HOME/.grok/skills"
+}
+
+gap_fill() {
+  local dest name harness failed=0
+  shopt -s nullglob
+  for dest in "$HUB"/*; do
+    [[ -e $dest || -L $dest ]] || continue
+    name=$(basename "$dest")
+    while IFS= read -r harness; do
+      mkdir -p "$harness" || { failed=1; continue; }
+      if [[ -e $harness/$name || -L $harness/$name ]]; then
+        if [[ -L $harness/$name && $(readlink "$harness/$name") == "$dest" ]]; then continue; fi
+        log "skip unmanaged mirror $harness/$name"; continue
+      fi
+      ln -s -- "$dest" "$harness/$name" || failed=1
+    done < <(harness_dirs)
+  done
+  shopt -u nullglob
+  return "$failed"
+}
+
+
+hub_symlink_is_packaged() {
+  local dest=$1 raw resolved
+  raw=$(readlink -- "$dest" 2>/dev/null || true)
+  case $raw in /usr/share/*) return 0;; esac
+  resolved=$(readlink -f -- "$dest" 2>/dev/null || true)
+  [[ $resolved == /usr/share/* ]]
+}
+
+hub_symlink_is_dangling() {
+  local dest=$1 raw
+  [[ -L $dest ]] || return 1
+  raw=$(readlink -- "$dest" 2>/dev/null || true)
+  [[ $raw == *$'	'* ]] && return 0
+  [[ -e $dest ]] && return 1
+  return 0
+}
+
+sweep_dangling_hub_links() {
+  local dest failed=0
+  shopt -s nullglob
+  for dest in "$HUB"/*; do
+    [[ -L $dest ]] || continue
+    hub_symlink_is_dangling "$dest" || continue
+    hub_symlink_is_packaged "$dest" && continue
+    if rm -- "$dest"; then log "removed dangling hub skill $(basename -- "$dest")"; else failed=1; fi
+  done
+  shopt -u nullglob
+  return "$failed"
+}
+
+sweep_stale_harness_mirrors() {
+  local dest name raw failed=0 harness
+  while IFS= read -r harness; do
+    [[ -d $harness ]] || continue
+    shopt -s nullglob
+    for dest in "$harness"/*; do
+      [[ -L $dest ]] || continue
+      name=$(basename -- "$dest")
+      raw=$(readlink -- "$dest" 2>/dev/null || true)
+      [[ $raw == "$HUB/$name" ]] || continue
+      if [[ -e $HUB/$name ]]; then continue; fi
+      if rm -- "$dest"; then log "removed stale harness mirror $dest"; else failed=1; fi
+    done
+    shopt -u nullglob
+  done < <(harness_dirs)
+  return "$failed"
+}
+
+sync_hub() {
+  have git || { log "error: git required" >&2; return 1; }
+  [[ -f $SOURCES ]] || { log "error: missing sources manifest: $SOURCES" >&2; return 1; }
+  local url dir selector extra name target output failed=0 exclusions excluded_name stale_target
+  local -a excluded_names=()
+  while IFS=$'\t' read -r url dir selector extra || [[ -n ${url:-} ]]; do
+    [[ -z ${url:-} || $url == \#* ]] && continue
+    # Selector grammar: *, exact name, or *,!name[,!name...].
+    if [[ -z ${dir:-} || -z ${selector:-} || -n ${extra:-} ]]; then log "error: invalid three-field source record" >&2; failed=1; continue; fi
+    exclusions=; excluded_names=()
+    if [[ $selector == '*,!'* ]]; then
+      exclusions=${selector#*,!}; exclusions=${exclusions//,!/,}
+      if [[ -z $exclusions || $exclusions == ,* || $exclusions == *,,* || $exclusions == *, || $exclusions == *'!'* ]]; then log "error: invalid source selector: $selector" >&2; failed=1; continue; fi
+      IFS=, read -r -a excluded_names <<< "$exclusions"
+    elif [[ $selector == *,* ]]; then
+      log "error: invalid source selector: $selector" >&2; failed=1; continue
+    fi
+    dir=${dir/#\~/$HOME}
+    if ! ensure_clone "$url" "$dir"; then failed=1; continue; fi
+    if ! output=$(discover_skills "$dir"); then failed=1; continue; fi
+    if (( ${#excluded_names[@]} > 0 )); then
+      for excluded_name in "${excluded_names[@]}"; do
+        if [[ -L $HUB/$excluded_name ]]; then
+          stale_target=$(readlink -f -- "$HUB/$excluded_name" 2>/dev/null || true)
+          if [[ $stale_target == "$dir/skills/"* && $(basename "$stale_target") == "$excluded_name" ]]; then
+            if rm -- "$HUB/$excluded_name"; then log "excluded source skill $excluded_name from shared hub"; else log "error: cannot remove excluded source skill $excluded_name" >&2; failed=1; fi
+          fi
+        fi
+      done
+    fi
+    while IFS=$'\t' read -r name target; do
+      [[ -n $name ]] || continue
+      for excluded_name in "${excluded_names[@]}"; do
+        [[ $name != "$excluded_name" ]] || continue 2
+      done
+      [[ $selector == '*' || $selector == "$name" || ${#excluded_names[@]} -gt 0 ]] || continue
+      link_hub_skill "$name" "$target" "$dir" || failed=1
+    done <<< "$output"
+  done <"$SOURCES"
+  sweep_dangling_hub_links || failed=1
+  gap_fill || failed=1
+  sweep_stale_harness_mirrors || failed=1
+  return "$failed"
+}
+
+refresh_canonical() {
+  ensure_clone https://github.com/obra/superpowers.git "$CANONICAL" || return 1
+  tag=$(git -C "$CANONICAL" describe --tags --always 2>/dev/null) || return 1
+  log "canonical $tag"
+}
+
+copy_cursor() {
+  mkdir -p "$CURSOR_PLUGIN"
+  rm -rf "$CURSOR_PLUGIN/.git"
+  tar --exclude='.git' -C "$CANONICAL" -cf - . | tar -C "$CURSOR_PLUGIN" -xf -
+  local v
+  v=$(plugin_version "$CURSOR_PLUGIN/.cursor-plugin/plugin.json" || true)
+  log "cursor copy version=${v:-unknown}"
+}
+
+opencode_major() {
+  local ver
+  ver=$(opencode --version 2>/dev/null | grep -Eo '[0-9]+' | head -n 1 || true)
+  printf '%s\n' "${ver:-1}"
+}
+
+apply_opencode() {
+  have opencode || { log "skip opencode: not on PATH"; return 0; }
+  have jq || die "jq required to patch opencode.json"
+  [[ -f $OPENCODE_JSON ]] || die "missing $OPENCODE_JSON"
+  local key spec tmp
+  spec="superpowers@git+https://github.com/obra/superpowers.git#${tag}"
+  if [[ $(opencode_major) -ge 2 ]]; then
+    key=plugins
+  else
+    key=plugin
+  fi
+  tmp=$(mktemp)
+  jq --arg spec "$spec" --arg key "$key" '
+    .[$key] = ((.[$key] // []) | map(select(tostring | test("superpowers") | not)) + [$spec])
+  ' "$OPENCODE_JSON" >"$tmp"
+  mv "$tmp" "$OPENCODE_JSON"
+  log "opencode $key=$spec"
+}
+
+apply_claude() {
+  have claude || { log "skip claude: not on PATH"; return 0; }
+  claude plugin marketplace add "$CANONICAL" </dev/null
+  claude plugin install superpowers@superpowers-dev </dev/null
+}
+
+apply_pi() {
+  have pi || { log "skip pi: not on PATH"; return 0; }
+  pi install git:github.com/obra/superpowers
+}
+
+apply_omp() {
+  have omp || { log "skip omp: not on PATH"; return 0; }
+  local inventory path resolved
+  inventory=$(omp plugin list --json) || return 1
+  path=$(jq -r '.npm[]? | select(.name=="superpowers" and .enabled==true) | .path' <<< "$inventory" | head -n1)
+  if [[ -n $path ]]; then
+    resolved=$(readlink -f "$path" 2>/dev/null || true)
+    if [[ $resolved == "$(readlink -f "$CANONICAL")" ]]; then log "omp Superpowers active at $path"; return 0; fi
+    log "error: enabled Superpowers registration resolves to unexpected path: $path" >&2; return 1
+  fi
+  if jq -e '.npm[]? | select(.name=="superpowers")' <<< "$inventory" >/dev/null; then
+    log "error: existing Superpowers registration is disabled; preserving OMP setting" >&2; return 1
+  fi
+  omp plugin link "$CANONICAL" </dev/null
+}
+
+apply_hermes() {
+  have hermes || { log "skip hermes: not on PATH"; return 0; }
+  local installed want=${tag#v}
+  installed=$(plugin_version "$HOME/.hermes/plugins/superpowers/.cursor-plugin/plugin.json" || true)
+  if [[ -n $installed && -n $want && ( $installed == "$tag" || $installed == "$want" ) ]]; then
+    log "skip hermes: already $installed"
+    return 0
+  fi
+  if hermes plugins update superpowers </dev/null; then
+    return 0
+  fi
+  hermes plugins install obra/superpowers --enable </dev/null
+}
+
+apply_gemini() {
+  have gemini || { log "skip gemini: not on PATH"; return 0; }
+  export GEMINI_CLI_TRUST_WORKSPACE=true
+  local out
+  if gemini extensions list 2>/dev/null | grep -qi superpowers; then
+    out=$(gemini extensions update superpowers </dev/null 2>&1) || true
+    if already_ok "$out" || gemini extensions list 2>/dev/null | grep -qi superpowers; then
+      log "gemini already present"
+      return 0
+    fi
+    printf '%s\n' "$out"
+    return 1
+  fi
+  out=$(printf 'y\n' | gemini extensions install --consent --skip-settings "$CANONICAL" 2>&1) || true
+  if already_ok "$out" || gemini extensions list 2>/dev/null | grep -qi superpowers; then
+    log "gemini already present"
+    return 0
+  fi
+  printf '%s\n' "$out"
+  return 1
+}
+
+apply_muse() {
+  have muse || { log "skip muse: not on PATH"; return 0; }
+  if muse plugins install "$CANONICAL" </dev/null; then
+    muse plugins approve superpowers </dev/null || muse plugins update superpowers || true
+    return 0
+  fi
+  log "muse leftover: this muse binary has no plugins command"
+  return 0
+}
+
+apply_codex() {
+  have codex || { log "skip codex: not on PATH"; return 0; }
+  if codex plugin install superpowers </dev/null 2>/dev/null; then
+    return 0
+  fi
+  if codex plugins install superpowers </dev/null 2>/dev/null; then
+    return 0
+  fi
+  log "codex leftover: no non-interactive plugin CLI; install Superpowers via /plugins in a Codex session"
+  return 0
+}
+
+watchlist() {
+  local bin
+  for bin in "${WATCHLIST[@]}"; do
+    if have "$bin"; then
+      log "unsupported harness on PATH: $bin — add a native Superpowers adapter (do not copy skills/)"
+    fi
+  done
+}
+
+verify() {
+  log "verify tag=$tag"
+  log "  canonical $(plugin_version "$CANONICAL/.cursor-plugin/plugin.json" || echo missing)"
+  log "  cursor    $(plugin_version "$CURSOR_PLUGIN/.cursor-plugin/plugin.json" || echo missing)"
+  log "  pi        $(plugin_version "$HOME/.pi/agent/git/github.com/obra/superpowers/.cursor-plugin/plugin.json" || echo missing)"
+  log "  omp       $(omp plugin list 2>/dev/null | tr '\n' ' ' | head -c 200 || echo missing)"
+  log "  hermes    $(plugin_version "$HOME/.hermes/plugins/superpowers/.cursor-plugin/plugin.json" || echo missing)"
+}
+
+sync_superpowers() {
+  have tar || { log "error: tar required" >&2; return 1; }
+  refresh_canonical || return 1
+  local failed=0 name
+  copy_cursor || failed=1
+  for name in claude pi omp hermes gemini opencode muse codex; do try "$name" "apply_$name" || failed=1; done
+  watchlist || failed=1
+  verify || failed=1
+  log "applied $tag"
+  return "$failed"
+}
+
+main() {
+  have git || die "git required"
+  cd "$HOME"
+  set +e
+  sync_hub
+  set -e
+  if [[ $hub_fatal -ne 0 ]]; then
+    die "hub sync failed"
+  fi
+  sync_superpowers
+}
+
+usage() {
+  cat <<'EOF'
+Usage: skills-sync [--check|--help]
+  (no args)  update skills and native plugins
+  --check    validate Oh My Pi skill and plugin layout locally
+  --help     show this help
+EOF
+}
+
+skills_sync_dispatch() {
+  case $# in
+    0) main ;;
+    1)
+      case $1 in
+        --check) check_omp_layout ;;
+        --help|-h) usage ;;
+        *) usage >&2; exit 2 ;;
+      esac
+      ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+source "$(dirname "${BASH_SOURCE[0]}")/skills-sync-integrations.sh"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  skills_sync_dispatch "$@"
+fi

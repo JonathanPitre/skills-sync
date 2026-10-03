@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+<!-- Managed by skills-sync; keep account-specific rule content elsewhere. -->
+Superpowers remains the default workflow for ordinary development. Use pstack, its helper skills, and its bundled agents only after an explicit user request for pstack, /poteto-mode, or a named pstack skill. For that task, follow the selected pstack workflow instead of starting a second competing Superpowers process. On explicit pstack activation, read ~/.cursor/rules/pstack-models.mdc if present for native role choices. A fresh ordinary chat returns to the default workflow. Cursor marketplace pstack remains installed and Cursor-managed; this is routing guidance, not loader isolation.

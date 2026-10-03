@@ -1,0 +1,6 @@
+# git_url<TAB>clone_dir<TAB>selector (*, exact name, or *,!name[,!name...])
+https://github.com/nicolas-found42/mattpocock-skills-omp.git	~/.local/src/mattpocock-skills-omp	*,!teach,!tdd
+https://github.com/DietrichGebert/ponytail.git	~/.local/src/ponytail	*
+https://github.com/mvanhorn/last30days-skill.git	~/.local/src/last30days	*
+https://github.com/anthropics/skills.git	~/.local/src/anthropic-skills	frontend-design
+https://github.com/jnsahaj/skills.git	~/.local/src/jnsahaj-skills	*

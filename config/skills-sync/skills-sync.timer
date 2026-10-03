@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily and login agent-skills hub sync across harnesses
+
+[Timer]
+OnCalendar=daily
+OnStartupSec=3min
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target
