@@ -44,3 +44,9 @@ Each hub sync removes updater-owned **dangling** hub symlinks (broken targets or
 | `config/skills-sync/sources` | git skill sources |
 | `config/skills-sync/*.service,*.timer` | systemd user units |
 | `tests/skills-sync.sh` | installer-independent tests |
+
+If an existing `~/.local/src/oh-my-pstack` clone still has `origin` set to shrimpwtf, `ensure_clone` fails closed. Retarget once:
+
+```bash
+git -C ~/.local/src/oh-my-pstack remote set-url origin https://github.com/JonathanPitre/oh-my-pstack.git
+```
