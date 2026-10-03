@@ -46,8 +46,6 @@ Disable later: `systemctl --user disable --now skills-sync.timer`.
 
 ## 📚 Skills included
 
-Shipped by this package. Omarchy-packaged skills (`omarchy`, `diagnose-crash`) may already exist on Omarchy hosts; they are not published from this repo.
-
 ### 🧠 Matt Pocock (hub)
 
 Excludes `teach` and `tdd` (those stay in pstack-pi only).
