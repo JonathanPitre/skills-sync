@@ -18,16 +18,16 @@ Cursor marketplace pstack remains Cursor-managed. This package does not replace 
 
 Upstream [shrimpwtf/oh-my-pstack](https://github.com/shrimpwtf/oh-my-pstack) last pushed 2026-09-01. OMP pstack-pi is cloned from **https://github.com/JonathanPitre/oh-my-pstack.git** (public fork).
 
-Merged onto fork `main` with a merge commit:
+Merged onto fork `main` with merge commits:
 
-- [shrimpwtf/oh-my-pstack#4](https://github.com/shrimpwtf/oh-my-pstack/pull/4) — port pstack 0.15.2
+- [shrimpwtf/oh-my-pstack#4](https://github.com/shrimpwtf/oh-my-pstack/pull/4) — port pstack 0.15.2 (on `origin/main`)
+- [shrimpwtf/oh-my-pstack#5](https://github.com/shrimpwtf/oh-my-pstack/pull/5) — OMP Task / `skill://` compatibility (resolved in `~/Work/oh-my-pstack`; push, then run `skills-sync` to republish `pstack-pi`)
 
-**Not merged** (conflicted with #4; do not silently resolve):
+**Not merged yet:**
 
-- [shrimpwtf/oh-my-pstack#5](https://github.com/shrimpwtf/oh-my-pstack/pull/5) — OMP Task / `skill://` compatibility
-- [shrimpwtf/oh-my-pstack#1](https://github.com/shrimpwtf/oh-my-pstack/pull/1) — Pi portable router
+- [shrimpwtf/oh-my-pstack#1](https://github.com/shrimpwtf/oh-my-pstack/pull/1) — Pi portable router (attempt after #5 is on `origin/main`)
 
-Local clone with remotes: `~/Work/oh-my-pstack` (`origin` = fork, `upstream` = shrimpwtf). Rebase or merge `upstream/main` when it moves, then re-attempt #5 and #1 as merge commits.
+Local clone: `~/Work/oh-my-pstack` (`origin` = fork, `upstream` = shrimpwtf). Shared playbooks stay host-neutral (no literal `OMP` in the files guarded by `npm run test:sync`); OMP worktree and model-provenance detail live in `opening-a-pr.md`, `setup-pstack`, and `pstack-pi/references/runtime.md`.
 
 `ensure_clone` uses latest GitHub release if one exists, otherwise the default branch. This fork has no releases, so it tracks `main`.
 
